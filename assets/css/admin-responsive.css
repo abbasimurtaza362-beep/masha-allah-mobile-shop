@@ -1,0 +1,11 @@
+@media (max-width: 900px) {
+  .admin-wrap {
+    min-height: 0;
+    align-content: start;
+  }
+
+  .admin-sidebar {
+    align-self: start;
+    min-height: 0;
+  }
+}

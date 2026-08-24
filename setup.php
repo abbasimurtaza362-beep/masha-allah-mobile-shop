@@ -1,0 +1,8 @@
+<?php
+require_once __DIR__.'/config/database.php';require_once __DIR__.'/includes/functions.php';
+if (!in_array((string)($_SERVER['REMOTE_ADDR'] ?? ''), ['127.0.0.1','::1'], true)) { http_response_code(404); exit('Not found.'); }
+if (getenv('ALLOW_INITIAL_SETUP') !== '1') { http_response_code(404); exit('Not found.'); }
+$count=(int)db()->query("SELECT COUNT(*) FROM users WHERE role='admin'")->fetchColumn();if($count){exit('An admin already exists. Disable setup access now.');}
+if($_SERVER['REQUEST_METHOD']==='POST'){verify_csrf();$name=trim($_POST['name']??'');$email=filter_var(trim($_POST['email']??''),FILTER_VALIDATE_EMAIL);$password=$_POST['password']??'';if(strlen($name)<2||!$email||strlen($password)<12)exit('Use a valid name, email and password of at least 12 characters.');$stmt=db()->prepare("INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,'admin')");$stmt->execute([$name,$email,password_hash($password,PASSWORD_DEFAULT)]);echo 'Admin created. Set ALLOW_INITIAL_SETUP=0 and remove this file before opening the site. Then <a href="admin/login.php">open the private admin portal</a>.';exit;}
+?><!doctype html><title>Setup Administrator</title><form method="post" style="max-width:400px;margin:40px auto;font-family:Arial"><h1>Create owner administrator</h1><input type="hidden" name="csrf" value="<?=csrf_token()?>"><p><input required name="name" placeholder="Owner name"></p><p><input required type="email" name="email" placeholder="Email"></p><p><input required minlength="12" type="password" name="password" placeholder="Password (12+ characters)"></p><button>Create secure admin</button><p>Set ALLOW_INITIAL_SETUP=0 and delete this file immediately after setup.</p></form>
+<?php require __DIR__ . '/includes/chat.php'; ?>

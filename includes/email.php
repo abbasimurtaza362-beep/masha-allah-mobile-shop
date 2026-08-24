@@ -5,418 +5,258 @@ require_once __DIR__ . '/../config/email.php';
 
 
 /**
- * Read complete SMTP response.
+ * Send an email through Brevo HTTPS API.
+ *
+ * This does NOT use SMTP.
+ * It uses HTTPS port 443.
  */
-function smtp_read($socket): string
-{
-    $data = '';
-
-    while (!feof($socket)) {
-        $line = fgets($socket, 515);
-
-        if ($line === false) {
-            break;
-        }
-
-        $data .= $line;
-
-        if (isset($line[3]) && $line[3] === ' ') {
-            break;
-        }
-    }
-
-    return $data;
-}
-
-
-/**
- * Check SMTP response code.
- * Logs the real SMTP response to Railway without exposing passwords.
- */
-function smtp_expect($socket, array $codes): void
-{
-    $response = smtp_read($socket);
-
-    $trimmed = trim($response);
-
-    $code = (int)substr($trimmed, 0, 3);
-
-    if (!in_array($code, $codes, true)) {
-
-        $cleanResponse = trim(
-            preg_replace('/\s+/', ' ', $response)
-        );
-
-        error_log(
-            'SMTP ERROR | Expected: ' .
-            implode(',', $codes) .
-            ' | Received: ' .
-            $code .
-            ' | Response: ' .
-            $cleanResponse
-        );
-
-        throw new RuntimeException(
-            'SMTP error ' .
-            $code .
-            ': ' .
-            $cleanResponse
-        );
-    }
-}
-
-
-/**
- * Send SMTP command and validate response.
- */
-function smtp_command(
-    $socket,
-    string $command,
-    array $codes
-): void {
-    fwrite(
-        $socket,
-        $command . "\r\n"
-    );
-
-    smtp_expect(
-        $socket,
-        $codes
-    );
-}
-
-
-/**
- * Send email through Brevo SMTP.
- */
-function smtp_send_mail(
+function brevo_send_email(
     string $to,
+    string $toName,
     string $subject,
     string $html,
     string $text
 ): void {
 
     global
-        $SMTP_HOST,
-        $SMTP_PORT,
-        $SMTP_USER,
-        $SMTP_PASS,
+        $BREVO_API_KEY,
         $SMTP_FROM_EMAIL,
         $SMTP_FROM_NAME;
 
 
     /*
-     * Check configuration first.
+     * Check configuration.
      */
     if (!email_configured()) {
 
         throw new RuntimeException(
-            'Email service is not configured. ' .
-            'Check Brevo SMTP credentials and verified sender.'
+            email_setup_message()
         );
     }
 
 
     /*
-     * Create secure SSL context.
+     * Brevo transactional email API.
+     *
+     * Official endpoint:
+     * https://api.brevo.com/v3/smtp/email
      */
-    $context = stream_context_create([
-        'ssl' => [
-            'verify_peer' => true,
-            'verify_peer_name' => true
-        ]
-    ]);
+    $url = 'https://api.brevo.com/v3/smtp/email';
 
 
     /*
-     * Connect to Brevo SMTP.
+     * Request body.
      */
-    $socket = @stream_socket_client(
-        'tcp://' . $SMTP_HOST . ':' . $SMTP_PORT,
-        $errno,
-        $errstr,
-        20,
-        STREAM_CLIENT_CONNECT,
-        $context
+    $payload = [
+        'sender' => [
+            'name' => $SMTP_FROM_NAME,
+            'email' => $SMTP_FROM_EMAIL
+        ],
+
+        'to' => [
+            [
+                'email' => $to,
+                'name' => $toName
+            ]
+        ],
+
+        'subject' => $subject,
+
+        'htmlContent' => $html,
+
+        'textContent' => $text
+    ];
+
+
+    /*
+     * Encode JSON.
+     */
+    $json = json_encode(
+        $payload,
+        JSON_UNESCAPED_UNICODE |
+        JSON_UNESCAPED_SLASHES
     );
 
 
-    if (!$socket) {
-
-        error_log(
-            'SMTP CONNECTION ERROR | ' .
-            'Host=' . $SMTP_HOST .
-            ' | Port=' . $SMTP_PORT .
-            ' | Error=' . $errstr .
-            ' | Code=' . $errno
-        );
+    if ($json === false) {
 
         throw new RuntimeException(
-            'Could not connect to the email server.'
+            'Could not prepare email request.'
         );
     }
 
 
-    stream_set_timeout(
-        $socket,
-        20
-    );
+    /*
+     * cURL is preferred because it handles
+     * HTTPS/TLS correctly.
+     */
+    if (!function_exists('curl_init')) {
+
+        throw new RuntimeException(
+            'PHP cURL extension is not available on the server.'
+        );
+    }
+
+
+    $curl = curl_init($url);
+
+
+    if ($curl === false) {
+
+        throw new RuntimeException(
+            'Could not initialize HTTPS email connection.'
+        );
+    }
 
 
     try {
 
-        /*
-         * SMTP greeting.
-         */
-        smtp_expect(
-            $socket,
-            [220]
+        curl_setopt_array(
+            $curl,
+            [
+                CURLOPT_POST => true,
+
+                CURLOPT_POSTFIELDS => $json,
+
+                CURLOPT_HTTPHEADER => [
+                    'accept: application/json',
+                    'api-key: ' . $BREVO_API_KEY,
+                    'content-type: application/json'
+                ],
+
+                CURLOPT_RETURNTRANSFER => true,
+
+                CURLOPT_CONNECTTIMEOUT => 15,
+
+                CURLOPT_TIMEOUT => 30,
+
+                CURLOPT_SSL_VERIFYPEER => true,
+
+                CURLOPT_SSL_VERIFYHOST => 2
+            ]
         );
 
 
         /*
-         * Identify client.
+         * Execute request.
          */
-        smtp_command(
-            $socket,
-            'EHLO localhost',
-            [250]
-        );
+        $response = curl_exec($curl);
 
 
         /*
-         * Start TLS encryption.
+         * cURL/network error.
          */
-        smtp_command(
-            $socket,
-            'STARTTLS',
-            [220]
-        );
+        if ($response === false) {
 
-
-        /*
-         * Enable TLS.
-         */
-        $crypto = stream_socket_enable_crypto(
-            $socket,
-            true,
-            STREAM_CRYPTO_METHOD_TLS_CLIENT
-        );
-
-
-        if ($crypto !== true) {
+            $curlError = curl_error($curl);
+            $curlErrno = curl_errno($curl);
 
             error_log(
-                'SMTP TLS ERROR | Could not establish TLS encryption.'
+                'BREVO API CONNECTION ERROR | Code=' .
+                $curlErrno .
+                ' | Error=' .
+                $curlError
             );
 
             throw new RuntimeException(
-                'Could not establish secure SMTP encryption.'
+                'Could not connect to the email service.'
             );
         }
 
 
         /*
-         * EHLO again after TLS.
+         * HTTP response code.
          */
-        smtp_command(
-            $socket,
-            'EHLO localhost',
-            [250]
+        $httpCode = (int)curl_getinfo(
+            $curl,
+            CURLINFO_HTTP_CODE
         );
 
 
         /*
-         * Authenticate.
+         * Decode Brevo response.
          */
-        smtp_command(
-            $socket,
-            'AUTH LOGIN',
-            [334]
+        $decoded = json_decode(
+            $response,
+            true
         );
 
 
         /*
-         * Username.
-         */
-        smtp_command(
-            $socket,
-            base64_encode($SMTP_USER),
-            [334]
-        );
-
-
-        /*
-         * Password / SMTP key.
+         * Success.
          *
-         * IMPORTANT:
-         * The password itself is NEVER logged.
+         * Brevo normally returns HTTP 201.
          */
-        smtp_command(
-            $socket,
-            base64_encode($SMTP_PASS),
-            [235]
+        if (
+            $httpCode >= 200 &&
+            $httpCode < 300
+        ) {
+
+            $messageId =
+                is_array($decoded) &&
+                isset($decoded['messageId'])
+                    ? (string)$decoded['messageId']
+                    : '';
+
+            error_log(
+                'BREVO EMAIL SENT | HTTP=' .
+                $httpCode .
+                ($messageId !== ''
+                    ? ' | MessageID=' . $messageId
+                    : '')
+            );
+
+            return;
+        }
+
+
+        /*
+         * Extract safe error information.
+         */
+        $brevoMessage = '';
+
+        if (
+            is_array($decoded) &&
+            isset($decoded['message'])
+        ) {
+            $brevoMessage =
+                (string)$decoded['message'];
+        }
+
+        if ($brevoMessage === '') {
+            $brevoMessage =
+                trim($response);
+        }
+
+
+        /*
+         * Never log the API key.
+         */
+        error_log(
+            'BREVO API ERROR | HTTP=' .
+            $httpCode .
+            ' | Message=' .
+            $brevoMessage
         );
 
 
-        /*
-         * Sender.
-         */
-        smtp_command(
-            $socket,
-            'MAIL FROM:<' . $SMTP_FROM_EMAIL . '>',
-            [250]
-        );
-
-
-        /*
-         * Recipient.
-         */
-        smtp_command(
-            $socket,
-            'RCPT TO:<' . $to . '>',
-            [250, 251]
-        );
-
-
-        /*
-         * Start email content.
-         */
-        smtp_command(
-            $socket,
-            'DATA',
-            [354]
-        );
-
-
-        /*
-         * Build MIME email.
-         */
-        $boundary = bin2hex(
-            random_bytes(12)
-        );
-
-
-        $headers = [];
-
-        $headers[] =
-            'From: ' .
-            $SMTP_FROM_NAME .
-            ' <' .
-            $SMTP_FROM_EMAIL .
-            '>';
-
-        $headers[] =
-            'To: <' .
-            $to .
-            '>';
-
-        $encodedSubject =
-            function_exists('mb_encode_mimeheader')
-                ? mb_encode_mimeheader(
-                    $subject,
-                    'UTF-8'
-                )
-                : $subject;
-
-        $headers[] =
-            'Subject: ' .
-            $encodedSubject;
-
-        $headers[] =
-            'MIME-Version: 1.0';
-
-        $headers[] =
-            'Content-Type: multipart/alternative; boundary="' .
-            $boundary .
-            '"';
-
-        $headers[] =
-            'Date: ' .
-            date(DATE_RFC2822);
-
-
-        $body =
-            implode(
-                "\r\n",
-                $headers
-            ) .
-            "\r\n\r\n";
-
-
-        /*
-         * Plain text version.
-         */
-        $body .=
-            '--' .
-            $boundary .
-            "\r\n" .
-            'Content-Type: text/plain; charset=UTF-8' .
-            "\r\n" .
-            'Content-Transfer-Encoding: 8bit' .
-            "\r\n\r\n" .
-            $text .
-            "\r\n\r\n";
-
-
-        /*
-         * HTML version.
-         */
-        $body .=
-            '--' .
-            $boundary .
-            "\r\n" .
-            'Content-Type: text/html; charset=UTF-8' .
-            "\r\n" .
-            'Content-Transfer-Encoding: 8bit' .
-            "\r\n\r\n" .
-            $html .
-            "\r\n\r\n";
-
-
-        /*
-         * End MIME message.
-         */
-        $body .=
-            '--' .
-            $boundary .
-            "--\r\n.";
-
-
-        fwrite(
-            $socket,
-            $body . "\r\n"
-        );
-
-
-        /*
-         * Brevo accepted the message.
-         */
-        smtp_expect(
-            $socket,
-            [250]
-        );
-
-
-        /*
-         * Close SMTP session.
-         */
-        smtp_command(
-            $socket,
-            'QUIT',
-            [221]
+        throw new RuntimeException(
+            'Brevo API error ' .
+            $httpCode .
+            ': ' .
+            $brevoMessage
         );
 
 
     } finally {
 
-        fclose($socket);
+        curl_close($curl);
     }
 }
 
 
 /**
- * Generate and send OTP email.
+ * Send OTP email.
  */
 function send_otp_email(
     string $to,
@@ -427,6 +267,9 @@ function send_otp_email(
     global $OTP_EXPIRY_MINUTES;
 
 
+    /*
+     * Prevent HTML injection in recipient name.
+     */
     $safeName = htmlspecialchars(
         $name,
         ENT_QUOTES,
@@ -434,6 +277,9 @@ function send_otp_email(
     );
 
 
+    /*
+     * OTP validity text.
+     */
     $validityText =
         $OTP_EXPIRY_MINUTES > 0
             ? 'This code expires in ' .
@@ -447,6 +293,7 @@ function send_otp_email(
      */
     $html =
         '<div style="font-family:Arial,sans-serif;background:#f4f7f8;padding:32px">' .
+
             '<div style="max-width:560px;margin:auto;background:#fff;border-radius:18px;padding:34px">' .
 
                 '<div style="font-size:12px;letter-spacing:2px;color:#b8842b;font-weight:700">' .
@@ -478,11 +325,12 @@ function send_otp_email(
                 '</p>' .
 
             '</div>' .
+
         '</div>';
 
 
     /*
-     * Plain text email.
+     * Plain text version.
      */
     $text =
         "Hello {$name},\n\n" .
@@ -492,10 +340,11 @@ function send_otp_email(
 
 
     /*
-     * Send.
+     * Send through Brevo API.
      */
-    smtp_send_mail(
+    brevo_send_email(
         $to,
+        $name,
         'Verify your Masha Allah Mobile account',
         $html,
         $text

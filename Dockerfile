@@ -1,16 +1,13 @@
-FROM php:8.4-apache
+FROM php:8.4-cli
 
 RUN docker-php-ext-install pdo pdo_mysql mysqli
 
-RUN a2dismod mpm_event mpm_worker || true \
-    && a2enmod mpm_prefork rewrite
+WORKDIR /app
 
-WORKDIR /var/www/html
+COPY . /app
 
-COPY . /var/www/html/
-
-RUN chown -R www-data:www-data /var/www/html
+RUN chmod -R 755 /app
 
 EXPOSE 8080
 
-CMD ["bash", "-c", "sed -i \"s/Listen 80/Listen ${PORT:-8080}/\" /etc/apache2/ports.conf && sed -i \"s/<VirtualHost \\*:80>/<VirtualHost *:${PORT:-8080}>/\" /etc/apache2/sites-available/000-default.conf && apache2-foreground"]
+CMD ["sh", "-c", "php -S 0.0.0.0:${PORT:-8080} -t /app"]
